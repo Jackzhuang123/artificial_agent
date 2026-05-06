@@ -1,7 +1,7 @@
 import os, yaml, time, json, torch, torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import pandas as pd
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from model import ModernTransformer
 from utils import Lion
 import matplotlib
@@ -115,18 +115,33 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Tokenizer
+    # ---------- Tokenizer 加载（修复 HuggingFace 格式不兼容问题） ----------
     tokenizer_path = "tinystories_tokenizer"
+
     if not os.path.exists(tokenizer_path):
         from utils import train_tokenizer
         print("Training BPE tokenizer (will take a few minutes)...")
         train_tokenizer(tokenizer_path, vocab_size=8192)
-    else:
-        print("Tokenizer found, loading...")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    tokenizer.pad_token = tokenizer.eos_token
 
-    # Data loading
+    # 安全加载：先尝试 AutoTokenizer，失败则用 PreTrainedTokenizerFast
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception:
+        from transformers import PreTrainedTokenizerFast
+        tokenizer_file = os.path.join(tokenizer_path, "tokenizer.json")
+        if not os.path.exists(tokenizer_file):
+            raise FileNotFoundError(f"Tokenizer file not found at {tokenizer_file}")
+        tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
+        tokenizer.pad_token = "<|pad|>"
+        tokenizer.eos_token = "<|endoftext|>"
+        tokenizer.unk_token = None
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(f"Tokenizer loaded, vocab size: {tokenizer.vocab_size}")
+
+    # ---------- 数据加载 ----------
     if IS_KAGGLE:
         train_csv = "/kaggle/input/tinystories/train.csv"
         val_csv   = "/kaggle/input/tinystories/validation.csv"
@@ -148,7 +163,7 @@ def main():
         val_texts = texts[split:]
     print(f"Train samples: {len(train_texts)}, Val samples: {len(val_texts)}")
 
-    # Base config
+    # ---------- 基础配置 ----------
     base_config = {
         "vocab_size": 8192,
         "d_model": 256,
@@ -169,7 +184,7 @@ def main():
         "use_swiglu": True
     }
 
-    # 完整对比实验（与需求图一致）
+    # ---------- 对比实验组 ----------
     experiments = {
         "Baseline (MoE+GQA+SwiGLU+RoPE)": base_config,
         "No MoE": {**base_config, "n_experts": 0},
@@ -180,7 +195,7 @@ def main():
     }
 
     EPOCHS = 2
-    STEPS_PER_EPOCH = 200  # 可据实际时间调整
+    STEPS_PER_EPOCH = 200  # 可根据时间调整
 
     results = {}
     start_time = time.time()
@@ -199,7 +214,7 @@ def main():
     total_time = time.time() - start_time
     print(f"\nAll experiments completed in {total_time/60:.1f} minutes.")
 
-    # 保存最终结果与绘图
+    # ---------- 保存最终结果并绘图 ----------
     with open("results.json", "w") as f:
         json.dump(results, f, indent=2)
 
@@ -217,7 +232,7 @@ def main():
     plt.savefig('loss_comparison.png', dpi=150)
     print("\n📊 Loss comparison saved to loss_comparison.png")
 
-    # 输出结论表格
+    # ---------- 输出结论 ----------
     print("\n======== Training Conclusions ========")
     print(f"{'Configuration':<30} {'Final Val Loss':>15}")
     print("-"*50)
