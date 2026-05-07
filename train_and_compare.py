@@ -88,7 +88,6 @@ def train_one_config(config, tokenizer, device, train_texts, val_texts, epochs, 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = nn.CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            # 修复多 GPU 下 aux_loss 可能非标量的问题
             loss = loss + aux_loss.mean()
             optimizer.zero_grad()
             loss.backward()
@@ -115,7 +114,7 @@ def train_one_config(config, tokenizer, device, train_texts, val_texts, epochs, 
         val_losses.append(avg_val)
         print(f"{config.get('name','')} - Epoch {epoch+1} Train Loss: {avg_train:.4f} | Val Loss: {avg_val:.4f}")
 
-    # 卸下 DataParallel 包装，便于保存和后续使用
+    # 卸下 DataParallel 包装
     if isinstance(model, nn.DataParallel):
         model = model.module
     return train_losses, val_losses, model
@@ -145,7 +144,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     print(f"Tokenizer loaded, vocab size: {tokenizer.vocab_size}")
 
-    # ---------- 数据加载 ----------
+    # ---------- 数据加载与清洗 ----------
     if IS_KAGGLE:
         base = "/kaggle/input/datasets/thedevastator/tinystories-narrative-classification"
         train_csv = os.path.join(base, "train.csv")
@@ -154,6 +153,7 @@ def main():
             print("Loading TinyStories from Kaggle CSVs...")
             train_df = pd.read_csv(train_csv)
             val_df = pd.read_csv(val_csv)
+            # 提取文本列并清洗
             train_texts = train_df.iloc[:, 0].tolist()
             val_texts = val_df.iloc[:, 0].tolist()
         else:
@@ -166,9 +166,16 @@ def main():
         split = int(0.8 * len(texts))
         train_texts = texts[:split]
         val_texts = texts[split:]
-    print(f"Train samples: {len(train_texts)}, Val samples: {len(val_texts)}")
 
-    # ---------- 基础配置（双卡，步数增加） ----------
+    # 清洗：转为字符串，去掉空字符串和仅含空白字符的样本
+    train_texts = [str(t) for t in train_texts if pd.notna(t)]
+    train_texts = [t for t in train_texts if t.strip()]
+    val_texts = [str(t) for t in val_texts if pd.notna(t)]
+    val_texts = [t for t in val_texts if t.strip()]
+
+    print(f"Train samples (after cleaning): {len(train_texts)}, Val samples: {len(val_texts)}")
+
+    # ---------- 基础配置 ----------
     base_config = {
         "vocab_size": 8192,
         "d_model": 256,
@@ -181,8 +188,8 @@ def main():
         "max_seq_len": 256,
         "dropout": 0.1,
         "n_experts": 2,
-        "batch_size": 16,          # 双卡
-        "lr": 6e-4,                # AdamW 学习率
+        "batch_size": 16,
+        "lr": 6e-4,
         "weight_decay": 0.01,
         "optimizer": "adamw",
         "use_rope": True,
@@ -199,8 +206,8 @@ def main():
         "Learned PE (no RoPE)": {**base_config, "use_rope": False},
     }
 
-    EPOCHS = 8                 # 更多 epoch
-    STEPS_PER_EPOCH = 1200     # 每 epoch 使用 1200 batch (19200 条数据)
+    EPOCHS = 8
+    STEPS_PER_EPOCH = 1200
 
     results = {}
     best_model_state = None
@@ -211,7 +218,6 @@ def main():
     for name, cfg in experiments.items():
         print(f"\n{'='*50}\nRunning: {name}\n{'='*50}")
         cfg["name"] = name
-        # 如果子配置没有 weight_decay，补上默认值
         if "weight_decay" not in cfg:
             cfg["weight_decay"] = 0.01
         train_losses, val_losses, model = train_one_config(
@@ -220,25 +226,22 @@ def main():
         )
         results[name] = {"train": train_losses, "val": val_losses}
 
-        # 记录最优模型
         final_val = val_losses[-1]
         if final_val < best_val:
             best_val = final_val
-            best_model_state = model.state_dict()   # 此时 model 已无 DataParallel 包装
+            best_model_state = model.state_dict()
             best_config = cfg
 
-        # 中间备份
         with open("results_backup.json", "w") as f:
             json.dump(results, f, indent=2)
 
-        # 释放显存
         del model
         torch.cuda.empty_cache()
 
     total_time = time.time() - start_time
     print(f"\nAll experiments completed in {total_time/60:.1f} minutes.")
 
-    # ---------- 保存最终结果并绘图 ----------
+    # ---------- 保存结果并绘图 ----------
     with open("results.json", "w") as f:
         json.dump(results, f, indent=2)
 
@@ -256,7 +259,6 @@ def main():
     plt.savefig('loss_comparison.png', dpi=150)
     print("\n📊 Loss comparison saved to loss_comparison.png")
 
-    # ---------- 输出结论 ----------
     print("\n======== Training Conclusions ========")
     print(f"{'Configuration':<30} {'Final Val Loss':>15}")
     print("-"*50)
@@ -264,7 +266,7 @@ def main():
         print(f"{name:<30} {losses['val'][-1]:>15.4f}")
     print("=======================================")
 
-    # ---------- 保存最佳模型并进行对话演示 ----------
+    # ---------- 保存最佳模型并演示对话 ----------
     if best_model_state is not None:
         torch.save(best_model_state, "best_model.pt")
         print(f"\n🏆 Best model saved with Val Loss: {best_val:.4f} (Config: {best_config.get('name')})")
