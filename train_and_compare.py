@@ -55,13 +55,19 @@ def train_one_config(config, tokenizer, device, train_texts, val_texts, epochs, 
     val_loader   = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False,
                               collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id))
 
-    model = ModernTransformer(config).to(device)
+    model = ModernTransformer(config)
+    # 多 GPU 并行
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs (DataParallel)")
+        model = nn.DataParallel(model)
+    model = model.to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    # 优化器与调度器
     if config.get("optimizer", "adamw") == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=0.01)
     else:
-        optimizer = Lion(model.parameters(), lr=config["lr"], weight_decay=0.01)
+        optimizer = Lion(model.parameters(), lr=config["lr"], weight_decay=config.get("weight_decay", 0.01))
 
     total_steps = epochs * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
@@ -106,25 +112,21 @@ def train_one_config(config, tokenizer, device, train_texts, val_texts, epochs, 
         val_losses.append(avg_val)
         print(f"{config.get('name','')} - Epoch {epoch+1} Train Loss: {avg_train:.4f} | Val Loss: {avg_val:.4f}")
 
-    del model
-    torch.cuda.empty_cache()
-    return train_losses, val_losses
+    # 返回模型（用于最终保存）和损失曲线
+    return train_losses, val_losses, model
 
 # -------------------- 主程序 --------------------
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Using device: {device} | GPUs: {torch.cuda.device_count()}")
 
-    # ---------- Tokenizer 加载（自动兼容缺少的配置文件）----------
+    # ---------- Tokenizer ----------
     tokenizer_path = "tinystories_tokenizer"
-
     if not os.path.exists(tokenizer_path):
         from utils import train_tokenizer
-        print("Tokenizer not found, training a new one (takes 2-3 minutes)...")
+        print("Tokenizer not found, training a new one...")
         train_tokenizer(tokenizer_path, vocab_size=8192)
 
-    # 直接用 tokenizer.json 创建 tokenizer，并补全所有配置文件
-    from transformers import PreTrainedTokenizerFast
     tokenizer_file = os.path.join(tokenizer_path, "tokenizer.json")
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_file=tokenizer_file,
@@ -133,18 +135,13 @@ def main():
         pad_token="<|pad|>",
         unk_token=None,
     )
-    # 保存一次，自动生成 special_tokens_map.json 和 tokenizer_config.json（如果缺失）
     tokenizer.save_pretrained(tokenizer_path)
-
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
     print(f"Tokenizer loaded, vocab size: {tokenizer.vocab_size}")
 
     # ---------- 数据加载 ----------
-    # ---------- 数据加载（使用 Kaggle 挂载的 CSV）----------
     if IS_KAGGLE:
-        # 注意：这里是你实际的挂载路径
         base = "/kaggle/input/datasets/thedevastator/tinystories-narrative-classification"
         train_csv = os.path.join(base, "train.csv")
         val_csv = os.path.join(base, "validation.csv")
@@ -164,10 +161,9 @@ def main():
         split = int(0.8 * len(texts))
         train_texts = texts[:split]
         val_texts = texts[split:]
-
     print(f"Train samples: {len(train_texts)}, Val samples: {len(val_texts)}")
 
-    # ---------- 基础配置 ----------
+    # ---------- 基础配置（针对双卡优化） ----------
     base_config = {
         "vocab_size": 8192,
         "d_model": 256,
@@ -180,8 +176,8 @@ def main():
         "max_seq_len": 256,
         "dropout": 0.1,
         "n_experts": 2,
-        "batch_size": 8,
-        "lr": 3e-4,
+        "batch_size": 16,          # 双卡加大 bs
+        "lr": 6e-4,                # 线性缩放学习率
         "steps": 500,
         "optimizer": "adamw",
         "use_rope": True,
@@ -193,27 +189,46 @@ def main():
         "Baseline (MoE+GQA+SwiGLU+RoPE)": base_config,
         "No MoE": {**base_config, "n_experts": 0},
         "MHA (n_kv_heads=8)": {**base_config, "n_kv_heads": 8},
-        "Lion optimizer": {**base_config, "optimizer": "lion"},
+        "Lion optimizer": {**base_config, "optimizer": "lion", "lr": 1.5e-4, "weight_decay": 0.001},
         "ReLU FFN (no SwiGLU)": {**base_config, "use_swiglu": False},
         "Learned PE (no RoPE)": {**base_config, "use_rope": False},
     }
 
-    EPOCHS = 2
-    STEPS_PER_EPOCH = 200  # 可根据时间调整
+    EPOCHS = 4                # 更多 epoch
+    STEPS_PER_EPOCH = 400     # 增加步数
 
     results = {}
+    best_model_state = None
+    best_val = float('inf')
+    best_config = None
+
     start_time = time.time()
     for name, cfg in experiments.items():
         print(f"\n{'='*50}\nRunning: {name}\n{'='*50}")
         cfg["name"] = name
-        train_losses, val_losses = train_one_config(
+        train_losses, val_losses, model = train_one_config(
             cfg, tokenizer, device, train_texts, val_texts,
             epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH
         )
         results[name] = {"train": train_losses, "val": val_losses}
-        # 中间备份
+
+        # 选出验证损失最低的模型（去掉 DataParallel 的包装，以便保存）
+        final_val = val_losses[-1]
+        if final_val < best_val:
+            best_val = final_val
+            # 如果模型是 DataParallel，取 model.module 以获得原始模型
+            if isinstance(model, nn.DataParallel):
+                best_model_state = model.module.state_dict()
+            else:
+                best_model_state = model.state_dict()
+            best_config = cfg
+
         with open("results_backup.json", "w") as f:
             json.dump(results, f, indent=2)
+
+        # 释放当前模型显存
+        del model
+        torch.cuda.empty_cache()
 
     total_time = time.time() - start_time
     print(f"\nAll experiments completed in {total_time/60:.1f} minutes.")
@@ -243,6 +258,39 @@ def main():
     for name, losses in results.items():
         print(f"{name:<30} {losses['val'][-1]:>15.4f}")
     print("=======================================")
+
+    # ---------- 保存最佳模型 ----------
+    if best_model_state is not None:
+        torch.save(best_model_state, "best_model.pt")
+        print(f"\n🏆 Best model saved with Val Loss: {best_val:.4f} (Config: {best_config.get('name')})")
+
+        # 加载模型并进行对话生成示例
+        print("\n--- Chat Demo with Best Model ---")
+        model = ModernTransformer(best_config).to(device)
+        model.load_state_dict(best_model_state)
+        model.eval()
+
+        # 对话循环（示例）
+        prompts = [
+            "Once upon a time",
+            "The little girl",
+            "He said",
+        ]
+        for prompt in prompts:
+            input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=50,
+                    temperature=0.7,
+                    top_k=50,
+                    eos_token_id=tokenizer.eos_token_id
+                )
+            generated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            print(f"Prompt: {prompt}")
+            print(f"Model: {generated}\n")
+    else:
+        print("No model saved, training may have failed.")
 
 if __name__ == "__main__":
     main()
