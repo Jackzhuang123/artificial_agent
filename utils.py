@@ -1,20 +1,39 @@
+import os
 import torch
 from torch.optim import Optimizer
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
 def train_tokenizer(save_path: str, vocab_size: int = 8192):
-    """Train a byte‑level BPE tokenizer on TinyStories."""
+    """Train a byte‑level BPE tokenizer on TinyStories and save it in HuggingFace‑compatible format."""
     from datasets import load_dataset
     dataset = load_dataset("roneneldan/TinyStories", split="train")
     def batch_iterator(batch_size=1000):
         for i in range(0, len(dataset), batch_size):
             yield dataset[i:i+batch_size]["text"]
 
+    # Create directory if it doesn't exist
+    os.makedirs(save_path, exist_ok=True)
+
+    # Train the raw tokenizer with the tokenizers library
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
     trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=["<|endoftext|>", "<|pad|>"])
     tokenizer.train_from_iterator(batch_iterator(), trainer=trainer)
-    tokenizer.save(save_path)
+
+    # Save the tokenizer.json inside the directory
+    tokenizer_file = os.path.join(save_path, "tokenizer.json")
+    tokenizer.save(tokenizer_file)
+
+    # Wrap it in a HuggingFace PreTrainedTokenizerFast and save config files
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=tokenizer_file,
+        bos_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+        pad_token="<|pad|>",
+        unk_token=None,
+    )
+    hf_tokenizer.save_pretrained(save_path)
 
 # Lion optimizer (from https://arxiv.org/abs/2302.06675)
 class Lion(Optimizer):
