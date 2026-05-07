@@ -142,17 +142,20 @@ def main():
     print(f"Tokenizer loaded, vocab size: {tokenizer.vocab_size}")
 
     # ---------- 数据加载 ----------
+    # ---------- 数据加载（使用 Kaggle 挂载的 CSV）----------
     if IS_KAGGLE:
-        train_csv = "/kaggle/input/tinystories/train.csv"
-        val_csv   = "/kaggle/input/tinystories/validation.csv"
+        # 注意：这里是你实际的挂载路径
+        base = "/kaggle/input/datasets/thedevastator/tinystories-narrative-classification"
+        train_csv = os.path.join(base, "train.csv")
+        val_csv = os.path.join(base, "validation.csv")
         if os.path.exists(train_csv) and os.path.exists(val_csv):
-            print("Loading TinyStories from Kaggle input CSVs...")
+            print("Loading TinyStories from Kaggle CSVs...")
             train_df = pd.read_csv(train_csv)
-            val_df   = pd.read_csv(val_csv)
+            val_df = pd.read_csv(val_csv)
             train_texts = train_df.iloc[:, 0].tolist()
-            val_texts   = val_df.iloc[:, 0].tolist()
+            val_texts = val_df.iloc[:, 0].tolist()
         else:
-            raise FileNotFoundError("TinyStories CSV not found in /kaggle/input/tinystories/")
+            raise FileNotFoundError(f"CSVs not found in {base}")
     else:
         from datasets import load_dataset
         print("Loading TinyStories from HuggingFace (local)...")
@@ -161,6 +164,7 @@ def main():
         split = int(0.8 * len(texts))
         train_texts = texts[:split]
         val_texts = texts[split:]
+
     print(f"Train samples: {len(train_texts)}, Val samples: {len(val_texts)}")
 
     # ---------- 基础配置 ----------
