@@ -1,7 +1,7 @@
 import os, yaml, time, json, torch, torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import pandas as pd
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast
 from model import ModernTransformer
 from utils import Lion
 import matplotlib
@@ -65,8 +65,9 @@ def train_one_config(config, tokenizer, device, train_texts, val_texts, epochs, 
 
     # 优化器与调度器
     if config.get("optimizer", "adamw") == "adamw":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=0.01)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config.get("weight_decay", 0.01))
     else:
+        # Lion 需要低学习率，配置中已单独设置
         optimizer = Lion(model.parameters(), lr=config["lr"], weight_decay=config.get("weight_decay", 0.01))
 
     total_steps = epochs * steps_per_epoch
@@ -87,7 +88,8 @@ def train_one_config(config, tokenizer, device, train_texts, val_texts, epochs, 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = nn.CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            loss = loss + aux_loss
+            # 修复多 GPU 下 aux_loss 可能非标量的问题
+            loss = loss + aux_loss.mean()
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -104,15 +106,18 @@ def train_one_config(config, tokenizer, device, train_texts, val_texts, epochs, 
         with torch.no_grad():
             for input_ids, labels in val_loader:
                 input_ids, labels = input_ids.to(device), labels.to(device)
-                logits, _ = model(input_ids)
+                logits, aux_loss = model(input_ids)
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
-                val_loss += nn.CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)).item()
+                loss = nn.CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                val_loss += (loss + aux_loss.mean()).item()
         avg_val = val_loss / len(val_loader)
         val_losses.append(avg_val)
         print(f"{config.get('name','')} - Epoch {epoch+1} Train Loss: {avg_train:.4f} | Val Loss: {avg_val:.4f}")
 
-    # 返回模型（用于最终保存）和损失曲线
+    # 卸下 DataParallel 包装，便于保存和后续使用
+    if isinstance(model, nn.DataParallel):
+        model = model.module
     return train_losses, val_losses, model
 
 # -------------------- 主程序 --------------------
@@ -163,7 +168,7 @@ def main():
         val_texts = texts[split:]
     print(f"Train samples: {len(train_texts)}, Val samples: {len(val_texts)}")
 
-    # ---------- 基础配置（针对双卡优化） ----------
+    # ---------- 基础配置（双卡，步数增加） ----------
     base_config = {
         "vocab_size": 8192,
         "d_model": 256,
@@ -176,9 +181,9 @@ def main():
         "max_seq_len": 256,
         "dropout": 0.1,
         "n_experts": 2,
-        "batch_size": 16,          # 双卡加大 bs
-        "lr": 6e-4,                # 线性缩放学习率
-        "steps": 500,
+        "batch_size": 16,          # 双卡
+        "lr": 6e-4,                # AdamW 学习率
+        "weight_decay": 0.01,
         "optimizer": "adamw",
         "use_rope": True,
         "use_swiglu": True
@@ -189,13 +194,13 @@ def main():
         "Baseline (MoE+GQA+SwiGLU+RoPE)": base_config,
         "No MoE": {**base_config, "n_experts": 0},
         "MHA (n_kv_heads=8)": {**base_config, "n_kv_heads": 8},
-        "Lion optimizer": {**base_config, "optimizer": "lion", "lr": 1.5e-4, "weight_decay": 0.001},
+        "Lion optimizer": {**base_config, "optimizer": "lion", "lr": 1e-4, "weight_decay": 0.001},
         "ReLU FFN (no SwiGLU)": {**base_config, "use_swiglu": False},
         "Learned PE (no RoPE)": {**base_config, "use_rope": False},
     }
 
-    EPOCHS = 4                # 更多 epoch
-    STEPS_PER_EPOCH = 400     # 增加步数
+    EPOCHS = 8                 # 更多 epoch
+    STEPS_PER_EPOCH = 1200     # 每 epoch 使用 1200 batch (19200 条数据)
 
     results = {}
     best_model_state = None
@@ -206,27 +211,27 @@ def main():
     for name, cfg in experiments.items():
         print(f"\n{'='*50}\nRunning: {name}\n{'='*50}")
         cfg["name"] = name
+        # 如果子配置没有 weight_decay，补上默认值
+        if "weight_decay" not in cfg:
+            cfg["weight_decay"] = 0.01
         train_losses, val_losses, model = train_one_config(
             cfg, tokenizer, device, train_texts, val_texts,
             epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH
         )
         results[name] = {"train": train_losses, "val": val_losses}
 
-        # 选出验证损失最低的模型（去掉 DataParallel 的包装，以便保存）
+        # 记录最优模型
         final_val = val_losses[-1]
         if final_val < best_val:
             best_val = final_val
-            # 如果模型是 DataParallel，取 model.module 以获得原始模型
-            if isinstance(model, nn.DataParallel):
-                best_model_state = model.module.state_dict()
-            else:
-                best_model_state = model.state_dict()
+            best_model_state = model.state_dict()   # 此时 model 已无 DataParallel 包装
             best_config = cfg
 
+        # 中间备份
         with open("results_backup.json", "w") as f:
             json.dump(results, f, indent=2)
 
-        # 释放当前模型显存
+        # 释放显存
         del model
         torch.cuda.empty_cache()
 
@@ -259,18 +264,16 @@ def main():
         print(f"{name:<30} {losses['val'][-1]:>15.4f}")
     print("=======================================")
 
-    # ---------- 保存最佳模型 ----------
+    # ---------- 保存最佳模型并进行对话演示 ----------
     if best_model_state is not None:
         torch.save(best_model_state, "best_model.pt")
         print(f"\n🏆 Best model saved with Val Loss: {best_val:.4f} (Config: {best_config.get('name')})")
 
-        # 加载模型并进行对话生成示例
         print("\n--- Chat Demo with Best Model ---")
         model = ModernTransformer(best_config).to(device)
         model.load_state_dict(best_model_state)
         model.eval()
 
-        # 对话循环（示例）
         prompts = [
             "Once upon a time",
             "The little girl",
