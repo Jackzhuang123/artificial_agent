@@ -115,26 +115,26 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # ---------- Tokenizer 加载（修复 HuggingFace 格式不兼容问题） ----------
+    # ---------- Tokenizer 加载（自动兼容缺少的配置文件）----------
     tokenizer_path = "tinystories_tokenizer"
 
     if not os.path.exists(tokenizer_path):
         from utils import train_tokenizer
-        print("Training BPE tokenizer (will take a few minutes)...")
+        print("Tokenizer not found, training a new one (takes 2-3 minutes)...")
         train_tokenizer(tokenizer_path, vocab_size=8192)
 
-    # 安全加载：先尝试 AutoTokenizer，失败则用 PreTrainedTokenizerFast
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    except Exception:
-        from transformers import PreTrainedTokenizerFast
-        tokenizer_file = os.path.join(tokenizer_path, "tokenizer.json")
-        if not os.path.exists(tokenizer_file):
-            raise FileNotFoundError(f"Tokenizer file not found at {tokenizer_file}")
-        tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
-        tokenizer.pad_token = "<|pad|>"
-        tokenizer.eos_token = "<|endoftext|>"
-        tokenizer.unk_token = None
+    # 直接用 tokenizer.json 创建 tokenizer，并补全所有配置文件
+    from transformers import PreTrainedTokenizerFast
+    tokenizer_file = os.path.join(tokenizer_path, "tokenizer.json")
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=tokenizer_file,
+        bos_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+        pad_token="<|pad|>",
+        unk_token=None,
+    )
+    # 保存一次，自动生成 special_tokens_map.json 和 tokenizer_config.json（如果缺失）
+    tokenizer.save_pretrained(tokenizer_path)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
